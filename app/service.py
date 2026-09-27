@@ -5,6 +5,12 @@ from __future__ import annotations
 from .normalize import Issue, IssueCode, IssueSeverity, NormalizedEntry, normalize_entry
 from .audit import AuditEntry, audit_manifests
 from .mirror import MirrorOperation, plan_mirror
+from .relocation import (
+    RelocationConflictType,
+    build_rules,
+    detect_conflicts,
+    relocate_entries,
+)
 from .overlay import (
     OverlayNodeSource,
     OverlayStatus,
@@ -42,6 +48,11 @@ from .schemas import (
     PreflightRepairResponse,
     PreflightRequest,
     PreflightResponse,
+    RelocationConflictOut,
+    RelocationEntryOut,
+    RelocationPreviewRequest,
+    RelocationPreviewResponse,
+    RelocationSummary,
     Summary,
 )
 from .selection import apply_selection_rules
@@ -567,4 +578,79 @@ def run_manifest_audit(request: ManifestAuditRequest) -> ManifestAuditResponse:
         hierarchy_blocked=hierarchy_out,
         ambiguous_keys=ambiguous_out,
         summary=summary,
+    )
+
+
+def run_relocation_preview(
+    request: RelocationPreviewRequest,
+) -> RelocationPreviewResponse:
+    """路径重定位预演：按规则改写条目路径并预检结果冲突（纯内存）。
+
+    条目路径与规则前缀已在请求模型校验阶段确认安全（否则 422），
+    此处直接规范化并应用规则；同键重复与文件祖先冲突在重定位结果上
+    逐条检测，冲突条目不得标为可用。
+    """
+    normalized = [
+        normalize_entry(index=i, entry_type=e.type.value, original_path=e.path)
+        for i, e in enumerate(request.entries, start=1)
+    ]
+    rules = build_rules(
+        [
+            (
+                normalize_entry(
+                    index=i, entry_type="directory", original_path=rule.source_prefix
+                ),
+                normalize_entry(
+                    index=i, entry_type="directory", original_path=rule.target_prefix
+                ),
+            )
+            for i, rule in enumerate(request.rules)
+        ]
+    )
+
+    relocated = relocate_entries(normalized, rules)
+    detect_conflicts(relocated)
+
+    entries_out = [
+        RelocationEntryOut(
+            index=entry.index,
+            type=OverlayEntryType(entry.entry_type),
+            original_path=entry.original_path,
+            new_path=entry.new_path,
+            matched_rule_index=entry.matched_rule_index,
+            usable=entry.usable,
+            conflicts=[
+                RelocationConflictOut(
+                    type=conflict.type,
+                    related_indices=list(conflict.related_indices),
+                )
+                for conflict in entry.conflicts
+            ],
+        )
+        for entry in relocated
+    ]
+
+    key_counts: dict[str, int] = {}
+    for entry in relocated:
+        key_counts[entry.new_key] = key_counts.get(entry.new_key, 0) + 1
+    duplicate_key_entries = sum(
+        1 for entry in relocated if key_counts[entry.new_key] > 1
+    )
+    file_ancestor_pairs = sum(
+        len(conflict.related_indices)
+        for entry in relocated
+        for conflict in entry.conflicts
+        if conflict.type is RelocationConflictType.FILE_ANCESTOR
+    )
+    conflicted = sum(1 for entry in relocated if not entry.usable)
+    summary = RelocationSummary(
+        total=len(relocated),
+        usable=len(relocated) - conflicted,
+        conflicted=conflicted,
+        duplicate_key_groups=sum(1 for count in key_counts.values() if count > 1),
+        duplicate_key_entries=duplicate_key_entries,
+        file_ancestor_conflicts=file_ancestor_pairs,
+    )
+    return RelocationPreviewResponse(
+        target="windows", entries=entries_out, summary=summary
     )

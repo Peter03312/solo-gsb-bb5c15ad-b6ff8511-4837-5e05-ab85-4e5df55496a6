@@ -14,7 +14,11 @@
 把现存布局同步为期望布局的完整操作序列（删除多余/类型互换节点、建目录、写文件）；
 另有**清单核对**接口：给定约定清单与交付清单（条目含相对路径、`file`/`directory`
 类型与文件声明的 SHA-256），按 Windows 比较键核对缺失、额外、类型不符、摘要不符
-与一致，单侧同键重复整键列为歧义，一侧文件占据另一侧条目祖先路径时归为层级阻挡。
+与一致，单侧同键重复整键列为歧义，一侧文件占据另一侧条目祖先路径时归为层级阻挡；
+以及**路径重定位预演**接口：给定 `file`/`directory` 条目与按顺序排列的
+源前缀→目标前缀规则，按规范化路径段的比较键做前缀匹配改写路径
+（最长源前缀优先、同长度取最后一条，未命中保留原路径），并预检重定位结果中的
+同键重复与文件占据祖先路径冲突，逐条给出可用状态。
 
 > 服务**只对路径字符串做词法分析，全程不访问文件系统**，不会读取或写入任何条目。
 
@@ -359,6 +363,81 @@ curl -s http://localhost:8000/api/v1/manifest-audit \
 
 上例中两侧文件同键但 SHA-256 不同，结论进入 `digest_mismatches`。
 
+### `POST /api/v1/relocation-preview`
+
+路径重定位预演：给定 `file` / `directory` 条目与**按顺序排列的源前缀→目标
+前缀规则**，只在内存中按规则改写每条路径，并预检**重定位结果**中的同键重复
+与文件占据祖先路径冲突，逐条给出可用状态。全程纯内存计算，不访问文件系统。
+
+请求体：
+
+```json
+{
+  "entries": [
+    { "path": "old/docs/a.txt", "type": "file" },
+    { "path": "new/docs/a.txt", "type": "file" },
+    { "path": "old", "type": "directory" },
+    { "path": "keep.txt", "type": "file" }
+  ],
+  "rules": [
+    { "source_prefix": "old", "target_prefix": "new/docs" },
+    { "source_prefix": "old/docs", "target_prefix": "new/docs" }
+  ]
+}
+```
+
+- `entries`：待重定位的 `file` / `directory` 清单（至少 1 条）。
+- `rules`：按顺序排列的 `source_prefix` → `target_prefix` 规则（可省略或为
+  空，表示全部条目保留原路径）。
+
+规则语义：
+
+- **路径规范化**：条目路径与规则前缀均复用与预检接口相同的 Windows 规范化
+  规则（分隔符统一、NFC、段尾裁剪、保留名/非法字符检查、词法遍历），
+  比较键为 `casefold` 折叠后的规范路径段。**条目路径或任一规则前缀不安全
+  （绝对/UNC/盘符路径、越界 `..`、保留设备名、非法字符、空路径等）时整个
+  请求返回 422**。
+- **前缀匹配**：条目的规范路径段以规则的源前缀段开头即命中（按**路径段**
+  比较，源前缀 `ab` 不会命中段 `abc`）。多条命中时**最长源前缀优先**，
+  同长度取**输入顺序的最后一条**；未命中任何规则时保留原路径
+  （`new_path` 等于规范化后的原路径）。
+- **改写**：命中时新路径 = 目标前缀段 + 条目路径中未被源前缀覆盖的后缀段；
+  条目路径恰好等于源前缀时，新路径即目标前缀本身。
+
+结果冲突检测（均按重定位后的比较键，逐条列出冲突类型及相关原下标）：
+
+| 冲突类型 | 含义 |
+| --- | --- |
+| `DUPLICATE_KEY` | 重定位结果与其他条目同键重复（大小写/NFC/段尾点空格差异均被抹平，不分文件/目录） |
+| `FILE_ANCESTOR` | 本**文件**的结果路径占据其他条目结果路径的祖先路径 |
+| `BLOCKED_BY_FILE_ANCESTOR` | 本条目结果路径的祖先被其他**文件**的结果路径占据 |
+
+涉及任一冲突的条目 `usable` 恒为 `false`；目录占据祖先路径属于正常布局，
+不构成冲突。输入侧的同键重复与文件祖先布局**不返回 422**——重定位可能
+消除或制造冲突，一切以重定位结果为准。
+
+响应中的 `entries` **严格保持输入顺序**，`index` 从 1 开始：
+
+| 字段 | 说明 |
+| --- | --- |
+| `entries[].original_path` | 原始输入路径 |
+| `entries[].new_path` | 重定位后的新路径（正斜杠分隔、NFC、段尾已裁剪）；未命中规则时等于规范化后的原路径 |
+| `entries[].matched_rule_index` | 命中的规则下标（**从 0 开始**，与请求 `rules` 下标一致）；未命中为 `null` |
+| `entries[].usable` | 结果路径未涉及任何冲突时为 `true`；冲突条目恒为 `false` |
+| `entries[].conflicts` | 本条目涉及的冲突列表，每条含 `type`（上表）与 `related_indices`（冲突对方的原下标，从 1 开始，升序）；为空即可用 |
+| `summary` | `total / usable / conflicted` 计数，以及 `duplicate_key_groups`（同键重复组数）、`duplicate_key_entries`（涉及条目数）、`file_ancestor_conflicts`（文件祖先冲突对数） |
+
+curl 示例（服务监听宿主机 **8000** 端口）：
+
+```bash
+curl -s http://localhost:8000/api/v1/relocation-preview \
+  -H 'Content-Type: application/json' \
+  -d '{"entries":[{"path":"old/docs/a.txt","type":"file"},{"path":"keep.txt","type":"file"}],"rules":[{"source_prefix":"old/docs","target_prefix":"new/home"}]}'
+```
+
+上例中 `old/docs/a.txt` 命中规则被改写为 `new/home/a.txt`
+（`matched_rule_index` 为 0），`keep.txt` 未命中保留原路径，两条均可用。
+
 ## 规范化规则（Windows 目标）
 
 1. **统一分隔符**：`\` 与 `/` 均视为路径分隔符，输出统一为 `/`。
@@ -649,16 +728,17 @@ curl -s http://localhost:8000/api/v1/preflight \
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 路由（/health、/api/v1/preflight、/api/v1/overlay-preview、/api/v1/mirror-preview、/api/v1/manifest-audit）
+│   ├── main.py          # FastAPI 路由（/health、/api/v1/preflight、/api/v1/overlay-preview、/api/v1/mirror-preview、/api/v1/manifest-audit、/api/v1/relocation-preview）
 │   ├── normalize.py     # Windows 路径规范化与 unsafe 判定（纯函数）
-│   ├── schemas.py       # Pydantic 请求/响应模型（含 repair_plan、symlink_analysis、resource_limits、overlay-preview、mirror-preview、manifest-audit）
-│   ├── service.py       # 碰撞分组、层级冲突、资源预算、符号链接分析、覆盖预演、镜像同步预演与清单核对编排
+│   ├── schemas.py       # Pydantic 请求/响应模型（含 repair_plan、symlink_analysis、resource_limits、overlay-preview、mirror-preview、manifest-audit、relocation-preview）
+│   ├── service.py       # 碰撞分组、层级冲突、资源预算、符号链接分析、覆盖预演、镜像同步预演、清单核对与重定位预演编排
 │   ├── audit.py         # 清单核对：缺失/额外/类型不符/摘要不符/一致、层级阻挡与同键歧义（纯函数）
 │   ├── symlink.py       # 符号链接风险分析：目标越界、链接链循环、路径劫持（纯函数）
 │   ├── resource.py      # 解压资源预算校验：单文件/整批解压大小、整数交叉乘法压缩比（纯函数）
 │   ├── selection.py     # selection_rules glob 匹配（*、? 按段，** 跨多级）与 include/exclude 筛选（纯函数）
 │   ├── overlay.py       # 目标目录覆盖预演：清单校验、虚拟目录树与按序干跑（纯函数）
 │   ├── mirror.py        # 目录镜像同步预演：三阶段操作序列（删除→建目录→写文件，纯函数）
+│   ├── relocation.py    # 路径重定位预演：源前缀→目标前缀改写与结果冲突检测（纯函数）
 │   └── repair.py        # repair=true 确定性改名修复计划（纯函数）
 ├── tests/               # pytest 用例
 ├── docker/entrypoint.sh # 启动时安装依赖并启动服务

@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field, model_validator
 from .normalize import IssueCode, IssueSeverity, normalize_entry
 from .mirror import MirrorOperation
 from .audit import AuditStatus, ManifestSide
+from .relocation import RelocationConflictType
 from .overlay import (
     OverlayBlockReason,
     OverlayNodeSource,
@@ -756,3 +757,126 @@ class ManifestAuditResponse(BaseModel):
         ..., description="歧义键清单（按比较键升序），整键不任意配对"
     )
     summary: ManifestAuditSummary
+
+
+# ---------------------------------------------------------------------------
+# relocation-preview：路径重定位预演
+# ---------------------------------------------------------------------------
+
+
+class RelocationRuleIn(BaseModel):
+    source_prefix: str = Field(
+        ..., description="源前缀：按规范化路径段的比较键做前缀匹配，命中部分将被替换"
+    )
+    target_prefix: str = Field(
+        ..., description="目标前缀：替换命中条目的源前缀部分，与未匹配的后缀拼成新路径"
+    )
+
+
+def _relocation_error_codes(normalized) -> str:
+    return ", ".join(
+        issue.code.value
+        for issue in normalized.issues
+        if issue.severity == IssueSeverity.ERROR
+    )
+
+
+class RelocationPreviewRequest(BaseModel):
+    """路径重定位预演请求：条目 + 按顺序排列的源/目标前缀规则（纯内存）。"""
+
+    entries: list[OverlayEntryIn] = Field(
+        ..., min_length=1, description="待重定位的 file/directory 条目（至少 1 条）"
+    )
+    rules: list[RelocationRuleIn] = Field(
+        default_factory=list,
+        description=(
+            "按顺序排列的源前缀→目标前缀规则（可省略或为空，表示全部条目保留"
+            "原路径）；按规范化路径段的比较键做前缀匹配，最长源前缀优先、"
+            "同长度取最后一条"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_paths(self) -> "RelocationPreviewRequest":
+        # 条目路径与规则前缀均复用 Windows 规范化；不安全即拒绝（422）。
+        # 同键重复与文件祖先冲突不在此拒绝，而在重定位结果上逐条报告。
+        for i, entry in enumerate(self.entries, start=1):
+            normalized = normalize_entry(
+                index=i, entry_type=entry.type.value, original_path=entry.path
+            )
+            if normalized.unsafe:
+                raise ValueError(
+                    f"条目 #{i}（{entry.path!r}）路径不安全："
+                    f"{_relocation_error_codes(normalized)}"
+                )
+        for i, rule in enumerate(self.rules):
+            for label, prefix in (
+                ("源前缀", rule.source_prefix),
+                ("目标前缀", rule.target_prefix),
+            ):
+                normalized = normalize_entry(
+                    index=i, entry_type="directory", original_path=prefix
+                )
+                if normalized.unsafe:
+                    raise ValueError(
+                        f"规则 #{i} {label}（{prefix!r}）路径不安全："
+                        f"{_relocation_error_codes(normalized)}"
+                    )
+        return self
+
+
+class RelocationConflictOut(BaseModel):
+    type: RelocationConflictType = Field(
+        ...,
+        description=(
+            "冲突类型：DUPLICATE_KEY（重定位结果与其他条目同键重复）、"
+            "FILE_ANCESTOR（本文件结果路径占据其他条目的祖先路径）、"
+            "BLOCKED_BY_FILE_ANCESTOR（本条目祖先路径被其他文件结果路径占据）"
+        ),
+    )
+    related_indices: list[int] = Field(
+        ..., description="与本条目冲突的其他条目原下标（从 1 开始，升序）"
+    )
+
+
+class RelocationEntryOut(BaseModel):
+    index: int = Field(..., description="条目下标（从 1 开始，与输入顺序一致）")
+    type: OverlayEntryType
+    original_path: str = Field(..., description="原始输入路径")
+    new_path: str = Field(
+        ...,
+        description=(
+            "重定位后的新路径（正斜杠分隔、NFC、段尾已裁剪）；"
+            "未命中任何规则时等于规范化后的原路径"
+        ),
+    )
+    matched_rule_index: int | None = Field(
+        ...,
+        description="命中的规则下标（从 0 开始，与请求 rules 下标一致）；未命中为 null",
+    )
+    usable: bool = Field(
+        ..., description="结果路径未涉及任何冲突时为 true；冲突条目恒为 false"
+    )
+    conflicts: list[RelocationConflictOut] = Field(
+        default_factory=list,
+        description="本条目涉及的冲突（按类型分组，相关下标升序）；为空即可用",
+    )
+
+
+class RelocationSummary(BaseModel):
+    total: int = Field(..., description="条目总数")
+    usable: int = Field(..., description="结果无冲突、可用的条目数量")
+    conflicted: int = Field(..., description="涉及至少一项冲突的条目数量")
+    duplicate_key_groups: int = Field(..., description="结果同键重复的组数")
+    duplicate_key_entries: int = Field(..., description="涉及同键重复的条目数量")
+    file_ancestor_conflicts: int = Field(
+        ..., description="文件占据其他条目祖先路径的冲突对数"
+    )
+
+
+class RelocationPreviewResponse(BaseModel):
+    target: str = "windows"
+    entries: list[RelocationEntryOut] = Field(
+        ..., description="按输入顺序逐条给出重定位结果与冲突明细"
+    )
+    summary: RelocationSummary
