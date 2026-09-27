@@ -5,6 +5,7 @@ from __future__ import annotations
 from .normalize import Issue, IssueCode, IssueSeverity, NormalizedEntry, normalize_entry
 from .audit import AuditEntry, audit_manifests
 from .mirror import MirrorOperation, plan_mirror
+from .relocation import RelocationRule, plan_relocation
 from .overlay import (
     OverlayNodeSource,
     OverlayStatus,
@@ -42,6 +43,11 @@ from .schemas import (
     PreflightRepairResponse,
     PreflightRequest,
     PreflightResponse,
+    RelocationConflictOut,
+    RelocationEntryOut,
+    RelocationPreviewRequest,
+    RelocationPreviewResponse,
+    RelocationSummary,
     Summary,
 )
 from .selection import apply_selection_rules
@@ -567,4 +573,61 @@ def run_manifest_audit(request: ManifestAuditRequest) -> ManifestAuditResponse:
         hierarchy_blocked=hierarchy_out,
         ambiguous_keys=ambiguous_out,
         summary=summary,
+    )
+
+
+def run_relocation_preview(
+    request: RelocationPreviewRequest,
+) -> RelocationPreviewResponse:
+    """路径搬迁预演：按有序前缀规则改写条目路径并在结果路径上复检冲突（纯内存）。
+
+    条目路径与规则前缀已在请求模型校验阶段完成 Windows 规范化与安全校验
+    （否则 422），此处直接构建规则并交给 :func:`app.relocation.plan_relocation`。
+    """
+    normalized = [
+        normalize_entry(index=i, entry_type=e.type.value, original_path=e.path)
+        for i, e in enumerate(request.entries, start=1)
+    ]
+    rules: list[RelocationRule] = []
+    for i, rule_in in enumerate(request.rules):
+        source = normalize_entry(
+            index=i + 1, entry_type="directory", original_path=rule_in.source_prefix
+        )
+        target = normalize_entry(
+            index=i + 1, entry_type="directory", original_path=rule_in.target_prefix
+        )
+        rules.append(
+            RelocationRule(
+                index=i,
+                source_parts=tuple(source.canonical_parts),
+                target_parts=tuple(target.canonical_parts),
+            )
+        )
+
+    planned = plan_relocation(normalized, rules)
+
+    entries_out = [
+        RelocationEntryOut(
+            index=item.index,
+            type=OverlayEntryType(item.entry_type),
+            original_path=item.original_path,
+            new_path=item.new_path,
+            matched_rule_index=item.matched_rule_index,
+            usable=item.usable,
+            conflicts=[
+                RelocationConflictOut(type=conflict_type, related_index=related_index)
+                for conflict_type, related_index in item.conflicts
+            ],
+        )
+        for item in planned
+    ]
+
+    usable_count = sum(1 for item in planned if item.usable)
+    summary = RelocationSummary(
+        total=len(planned),
+        usable=usable_count,
+        conflicts=len(planned) - usable_count,
+    )
+    return RelocationPreviewResponse(
+        target="windows", entries=entries_out, summary=summary
     )

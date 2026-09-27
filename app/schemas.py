@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from .normalize import IssueCode, IssueSeverity, normalize_entry
 from .mirror import MirrorOperation
+from .relocation import RelocationConflictType
 from .audit import AuditStatus, ManifestSide
 from .overlay import (
     OverlayBlockReason,
@@ -561,6 +562,146 @@ class MirrorPreviewResponse(BaseModel):
     target: str = "windows"
     steps: list[MirrorStepOut]
     summary: MirrorSummary
+
+
+# ---------------------------------------------------------------------------
+# relocation-preview：按有序前缀规则预演路径搬迁
+# ---------------------------------------------------------------------------
+
+
+class RelocationRuleIn(BaseModel):
+    source_prefix: str = Field(
+        ...,
+        description=(
+            "源前缀（原始形式）：按规范化后的路径段比较键与条目路径逐段匹配，"
+            "须为非空的安全相对路径；不安全或规范化后为空时整个请求返回 422"
+        ),
+    )
+    target_prefix: str = Field(
+        ...,
+        description=(
+            "目标前缀（原始形式）：命中后与未匹配后缀拼成新路径，"
+            "须为非空的安全相对路径；不安全或规范化后为空时整个请求返回 422"
+        ),
+    )
+
+
+class RelocationPreviewRequest(BaseModel):
+    """路径搬迁预演请求：file/directory 条目 + 有序源/目标前缀规则（纯内存）。"""
+
+    entries: list[OverlayEntryIn] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "待搬迁的 file/directory 条目（至少 1 条）；条目路径不安全时"
+            "整个请求返回 422"
+        ),
+    )
+    rules: list[RelocationRuleIn] = Field(
+        default_factory=list,
+        description=(
+            "按顺序排列的源前缀/目标前缀规则（可为空，空列表等价于全部条目"
+            "未命中、保留原路径）；规则前缀不安全时整个请求返回 422。"
+            "匹配按规范化路径段的比较键逐段比较，最长源前缀优先，"
+            "同长度取最后一条"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_inputs(self) -> "RelocationPreviewRequest":
+        for i, entry in enumerate(self.entries, start=1):
+            normalized = normalize_entry(
+                index=i, entry_type=entry.type.value, original_path=entry.path
+            )
+            if normalized.unsafe:
+                codes = ", ".join(
+                    issue.code.value
+                    for issue in normalized.issues
+                    if issue.severity == IssueSeverity.ERROR
+                )
+                raise ValueError(
+                    f"条目 #{i}（{entry.path!r}）路径不安全：{codes}"
+                )
+        for i, rule in enumerate(self.rules):
+            for field_name, raw_prefix in (
+                ("源前缀", rule.source_prefix),
+                ("目标前缀", rule.target_prefix),
+            ):
+                normalized = normalize_entry(
+                    index=i + 1, entry_type="directory", original_path=raw_prefix
+                )
+                if normalized.unsafe or not normalized.canonical_parts:
+                    codes = ", ".join(
+                        issue.code.value
+                        for issue in normalized.issues
+                        if issue.severity == IssueSeverity.ERROR
+                    ) or "EMPTY_TARGET"
+                    raise ValueError(
+                        f"规则 #{i} 的{field_name}（{raw_prefix!r}）"
+                        f"不是安全的非空相对路径：{codes}"
+                    )
+        return self
+
+
+class RelocationConflictOut(BaseModel):
+    type: RelocationConflictType = Field(
+        ...,
+        description=(
+            "冲突类型：DUPLICATE_KEY（结果路径同键重复）、"
+            "BLOCKED_BY_FILE_ANCESTOR（本条目祖先路径被文件占据）、"
+            "BLOCKS_DESCENDANT（本文件条目占据其他条目的祖先路径）"
+        ),
+    )
+    related_index: int = Field(
+        ..., description="相关条目在输入 entries 中的原下标（从 1 开始）"
+    )
+
+
+class RelocationEntryOut(BaseModel):
+    index: int = Field(..., description="条目下标（从 1 开始，与输入顺序一致）")
+    type: OverlayEntryType
+    original_path: str = Field(..., description="原始输入路径")
+    new_path: str = Field(
+        ...,
+        description=(
+            "搬迁后路径（正斜杠分隔、NFC、段尾已裁剪）：命中规则时为"
+            "目标前缀与未匹配后缀拼接的结果；未命中时等于原规范路径"
+        ),
+    )
+    matched_rule_index: int | None = Field(
+        ...,
+        description=(
+            "命中规则在请求 rules 中的下标（从 0 开始）；"
+            "未命中任何规则时为 null"
+        ),
+    )
+    usable: bool = Field(
+        ...,
+        description=(
+            "搬迁结果是否可用：新路径既无同键重复、也未涉及文件祖先冲突时为 true"
+        ),
+    )
+    conflicts: list[RelocationConflictOut] = Field(
+        default_factory=list,
+        description=(
+            "该条目在结果路径上涉及的全部冲突（逐条列出冲突类型与相关原下标，"
+            "按相关原下标、冲突类型排序）；无冲突时为空列表"
+        ),
+    )
+
+
+class RelocationSummary(BaseModel):
+    total: int
+    usable: int = Field(..., description="搬迁结果可用（无任何冲突）的条目数量")
+    conflicts: int = Field(..., description="存在冲突、不可用的条目数量")
+
+
+class RelocationPreviewResponse(BaseModel):
+    target: str = "windows"
+    entries: list[RelocationEntryOut] = Field(
+        ..., description="按输入顺序排列的逐条搬迁预演结果"
+    )
+    summary: RelocationSummary
 
 
 class HealthResponse(BaseModel):

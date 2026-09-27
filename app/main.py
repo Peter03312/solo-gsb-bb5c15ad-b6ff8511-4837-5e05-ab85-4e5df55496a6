@@ -17,12 +17,15 @@ from .schemas import (
     OverlayPreviewResponse,
     PreflightRepairResponse,
     PreflightRequest,
+    RelocationPreviewRequest,
+    RelocationPreviewResponse,
 )
 from .service import (
     run_manifest_audit,
     run_mirror_preview,
     run_overlay_preview,
     run_preflight,
+    run_relocation_preview,
 )
 
 app = FastAPI(
@@ -38,9 +41,11 @@ app = FastAPI(
         " DELETE/KEEP_DIRECTORY/CREATE_DIRECTORY/OVERWRITE_FILE/CREATE_FILE 操作序列）；"
         "清单核对（约定清单 vs 交付清单：缺失、额外、类型不符、摘要不符、"
         "一致、层级阻挡与同键歧义，仅比较声明 SHA-256）。"
+        "路径搬迁预演（按有序源前缀/目标前缀规则改写条目路径，最长源前缀"
+        "优先、同长度取最后一条，在结果路径上复检同键重复与文件祖先冲突）。"
         "纯内存计算，不访问文件系统。"
     ),
-    version="1.6.0",
+    version="1.7.0",
 )
 
 
@@ -59,6 +64,7 @@ def root() -> dict[str, str]:
         "overlay_preview": "POST /api/v1/overlay-preview",
         "mirror_preview": "POST /api/v1/mirror-preview",
         "manifest_audit": "POST /api/v1/manifest-audit",
+        "relocation_preview": "POST /api/v1/relocation-preview",
     }
 
 
@@ -101,3 +107,15 @@ def mirror_preview(request: MirrorPreviewRequest) -> MirrorPreviewResponse:
 )
 def manifest_audit(request: ManifestAuditRequest) -> ManifestAuditResponse:
     return run_manifest_audit(request)
+
+
+@app.post(
+    "/api/v1/relocation-preview",
+    response_model=RelocationPreviewResponse,
+    tags=["overlay"],
+    summary="路径搬迁预演：按有序前缀规则改写路径并复检同键重复与文件祖先冲突（纯内存）",
+)
+def relocation_preview(
+    request: RelocationPreviewRequest,
+) -> RelocationPreviewResponse:
+    return run_relocation_preview(request)

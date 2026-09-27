@@ -15,6 +15,10 @@
 另有**清单核对**接口：给定约定清单与交付清单（条目含相对路径、`file`/`directory`
 类型与文件声明的 SHA-256），按 Windows 比较键核对缺失、额外、类型不符、摘要不符
 与一致，单侧同键重复整键列为歧义，一侧文件占据另一侧条目祖先路径时归为层级阻挡。
+另有**路径搬迁预演**接口：给定 `file`/`directory` 条目与按顺序排列的源前缀、
+目标前缀规则，按规范化路径段的比较键匹配（最长源前缀优先、同长度取最后一条）
+改写路径，并在结果路径上复检同键重复与文件祖先冲突，逐条给出原路径、新路径、
+命中规则下标与可用状态；全程只在内存预演。
 
 > 服务**只对路径字符串做词法分析，全程不访问文件系统**，不会读取或写入任何条目。
 
@@ -359,6 +363,81 @@ curl -s http://localhost:8000/api/v1/manifest-audit \
 
 上例中两侧文件同键但 SHA-256 不同，结论进入 `digest_mismatches`。
 
+### `POST /api/v1/relocation-preview`
+
+路径搬迁预演：给定 `file` / `directory` 条目与**按顺序排列**的源前缀、目标前缀
+规则，只在内存中把每个条目路径按规则改写为新路径，再在**结果路径**上复检
+同键重复与文件占据祖先路径冲突。全程纯内存词法计算，不访问文件系统，也不会
+真正移动任何文件。
+
+请求体：
+
+```json
+{
+  "entries": [
+    { "path": "docs/readme.txt", "type": "file" },
+    { "path": "docs/sub/logo.png", "type": "file" },
+    { "path": "src/blocker", "type": "file" },
+    { "path": "untouched.txt", "type": "file" }
+  ],
+  "rules": [
+    { "source_prefix": "docs", "target_prefix": "site/assets" },
+    { "source_prefix": "docs/sub", "target_prefix": "images" },
+    { "source_prefix": "src/blocker", "target_prefix": "site/assets" }
+  ]
+}
+```
+
+- `entries`：待搬迁的 `file` / `directory` 条目（至少 1 条，**不接受
+  `symlink`**）。条目路径复用与预检接口相同的 Windows 规范化规则（分隔符统一、
+  NFC、段尾裁剪、保留名/非法字符检查、词法遍历）；**条目路径不安全时整个请求
+  返回 422**。
+- `rules`：按顺序排列的源前缀/目标前缀规则，可省略或为空（空列表等价于全部
+  条目未命中、保留原路径）。两侧前缀均按目录路径复用同一套 Windows 规范化，
+  **规则前缀不安全或规范化后为空（如 `""`、`../x`、`/abs`、`CON`）时整个请求
+  返回 422**。
+- **匹配规则**：以规则源前缀的**规范化路径段比较键**（每段 `casefold` 折叠）
+  与条目规范路径的前若干段**逐段相等**判定命中，段边界必须对齐
+  （源前缀 `a/b` 不匹配 `a/bb`）；条目路径与源前缀等长也算命中（无后缀）。
+  多条命中时**最长源前缀优先，同长度取输入顺序中最后一条**；没有任何规则命中
+  时**保留原路径**（`matched_rule_index` 为 `null`）。
+- **新路径拼接**：命中后 `新路径 = 目标前缀规范段 + 条目未匹配后缀段`，后缀沿用
+  条目自身的规范段（保留原始大小写）；正斜杠分隔。
+- **结果冲突复检**（在全部条目搬迁后的新路径上）：
+
+  | 冲突类型 | 条件 |
+  | --- | --- |
+  | `DUPLICATE_KEY` | 两个条目的新路径 Windows 比较键相同（file/directory 同键也算），双向各记一条 |
+  | `BLOCKED_BY_FILE_ANCESTOR` | 本条目的某条严格祖先路径被另一条**文件**占据（记在后代上） |
+  | `BLOCKS_DESCENDANT` | 本**文件**条目的新路径是另一条目新路径的严格祖先（记在文件上） |
+
+  **冲突条目不得标为可用**（`usable=false`）；每个条目的 `conflicts` 逐条列出
+  冲突类型与相关条目的**原下标**（从 1 开始，按相关原下标、冲突类型排序）。
+  目录占据祖先路径属于正常布局，不构成冲突。
+
+响应中的 `entries` **严格保持输入顺序**，`index` 从 1 开始：
+
+| 字段 | 说明 |
+| --- | --- |
+| `entries[].original_path` | 原始输入路径 |
+| `entries[].new_path` | 搬迁后的规范路径（正斜杠分隔、NFC、段尾已裁剪）；未命中规则时等于原规范路径 |
+| `entries[].matched_rule_index` | 命中规则在请求 `rules` 中的下标（**从 0 开始**）；未命中为 `null` |
+| `entries[].usable` | 结果是否可用：新路径无同键重复且不涉及文件祖先冲突时为 `true` |
+| `entries[].conflicts` | 该条目涉及的全部冲突：每项含 `type` 与 `related_index`（相关原下标，从 1 开始）；无冲突为空列表 |
+| `summary` | `total / usable / conflicts`（存在冲突、不可用的条目数） |
+
+上例的搬迁结果（`docs/sub/logo.png` 命中更长的规则 #1 迁至 `images/logo.png`；
+`docs/readme.txt` 命中规则 #0 迁至 `site/assets/readme.txt`，与迁至
+`site/assets` 的文件 #3 构成文件祖先冲突；`untouched.txt` 未命中、保留原路径）。
+
+curl 示例（服务监听宿主机 **8000** 端口）：
+
+```bash
+curl -s http://localhost:8000/api/v1/relocation-preview \
+  -H 'Content-Type: application/json' \
+  -d '{"entries":[{"path":"docs\\readme.txt","type":"file"},{"path":"keep.txt","type":"file"}],"rules":[{"source_prefix":"docs","target_prefix":"site"}]}'
+```
+
 ## 规范化规则（Windows 目标）
 
 1. **统一分隔符**：`\` 与 `/` 均视为路径分隔符，输出统一为 `/`。
@@ -649,16 +728,17 @@ curl -s http://localhost:8000/api/v1/preflight \
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 路由（/health、/api/v1/preflight、/api/v1/overlay-preview、/api/v1/mirror-preview、/api/v1/manifest-audit）
+│   ├── main.py          # FastAPI 路由（/health、/api/v1/preflight、/api/v1/overlay-preview、/api/v1/mirror-preview、/api/v1/manifest-audit、/api/v1/relocation-preview）
 │   ├── normalize.py     # Windows 路径规范化与 unsafe 判定（纯函数）
-│   ├── schemas.py       # Pydantic 请求/响应模型（含 repair_plan、symlink_analysis、resource_limits、overlay-preview、mirror-preview、manifest-audit）
-│   ├── service.py       # 碰撞分组、层级冲突、资源预算、符号链接分析、覆盖预演、镜像同步预演与清单核对编排
+│   ├── schemas.py       # Pydantic 请求/响应模型（含 repair_plan、symlink_analysis、resource_limits、overlay-preview、mirror-preview、manifest-audit、relocation-preview）
+│   ├── service.py       # 碰撞分组、层级冲突、资源预算、符号链接分析、覆盖预演、镜像同步预演、清单核对与路径搬迁预演编排
 │   ├── audit.py         # 清单核对：缺失/额外/类型不符/摘要不符/一致、层级阻挡与同键歧义（纯函数）
 │   ├── symlink.py       # 符号链接风险分析：目标越界、链接链循环、路径劫持（纯函数）
 │   ├── resource.py      # 解压资源预算校验：单文件/整批解压大小、整数交叉乘法压缩比（纯函数）
 │   ├── selection.py     # selection_rules glob 匹配（*、? 按段，** 跨多级）与 include/exclude 筛选（纯函数）
 │   ├── overlay.py       # 目标目录覆盖预演：清单校验、虚拟目录树与按序干跑（纯函数）
 │   ├── mirror.py        # 目录镜像同步预演：三阶段操作序列（删除→建目录→写文件，纯函数）
+│   ├── relocation.py    # 路径搬迁预演：有序前缀规则匹配（最长优先/同长取后）与结果冲突复检（纯函数）
 │   └── repair.py        # repair=true 确定性改名修复计划（纯函数）
 ├── tests/               # pytest 用例
 ├── docker/entrypoint.sh # 启动时安装依赖并启动服务
